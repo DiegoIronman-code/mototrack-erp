@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Costos y precios subidos por el equipo: son datos del negocio, no van al repo.
+data/
