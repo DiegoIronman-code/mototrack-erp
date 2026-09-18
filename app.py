@@ -13,6 +13,9 @@ import io
 import json
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")  # backend sin pantalla/navegador, sirve en cualquier servidor
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -719,7 +722,79 @@ def generar_conclusiones(df_clasificacion: pd.DataFrame) -> list:
     return conclusiones
 
 
-def construir_reporte_pdf_gerencial(df_clasificacion: pd.DataFrame, fig_pareto, fig_matriz) -> bytes:
+def construir_pareto_abc_png(
+    df_clasificacion: pd.DataFrame, corte_a: float = ABC_CORTE_A_DEFAULT, corte_b: float = ABC_CORTE_B_DEFAULT
+) -> bytes:
+    """Version del Pareto ABC dibujada con matplotlib (sin navegador), para
+    incrustar en el PDF."""
+    colores_abc = {"A": "#000C66", "B": "#00A9E0", "C": "#FF9900"}
+    df = df_clasificacion.sort_values("UTILIDAD_TOTAL", ascending=False)
+
+    fig, ax1 = plt.subplots(figsize=(10, 5.2))
+    ax1.bar(df["unique_id"], df["UTILIDAD_TOTAL"], color=[colores_abc.get(c, "gray") for c in df["CLASE_ABC"]])
+    ax1.set_xlabel("SKU")
+    ax1.set_ylabel("Utilidad total")
+    ax1.tick_params(axis="x", rotation=35)
+    for etiqueta in ax1.get_xticklabels():
+        etiqueta.set_ha("right")
+
+    ax2 = ax1.twinx()
+    ax2.plot(df["unique_id"], df["PCT_ACUM_UTILIDAD"], color="#1A1A1A", marker="o")
+    ax2.set_ylabel("% acumulado")
+    ax2.set_ylim(0, 105)
+    for corte in (corte_a, corte_b):
+        ax2.axhline(corte, color="#57606A", linestyle="dotted")
+
+    ax1.set_title("Pareto de utilidad por SKU (clasificacion ABC)")
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150)
+    plt.close(fig)
+    return buffer.getvalue()
+
+
+def construir_matriz_abc_xyz_png(df_clasificacion: pd.DataFrame) -> bytes:
+    """Version de la matriz ABC-XYZ dibujada con matplotlib (sin navegador),
+    para incrustar en el PDF."""
+    columnas_abc = ["C", "B", "A"]
+    filas_xyz = ["X", "Y", "Z"]  # de abajo hacia arriba: Z queda arriba, X abajo
+    colores_fila = {"X": "#8FBF8F", "Y": "#F5C453", "Z": "#E2703A"}
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    for i, xyz in enumerate(filas_xyz):
+        for j, abc in enumerate(columnas_abc):
+            ax.add_patch(plt.Rectangle((j, i), 1, 1, facecolor=colores_fila[xyz], edgecolor="white"))
+            sub = df_clasificacion[
+                (df_clasificacion["CLASE_ABC"] == abc) & (df_clasificacion["CLASE_XYZ"] == xyz)
+            ]
+            if sub.empty:
+                texto = "—"
+            else:
+                texto = "\n".join(
+                    f"{fila['unique_id']}\n${fila['UTILIDAD_TOTAL']:,.0f} · {fila['SCORE_PORC']:.1f}%"
+                    for _, fila in sub.iterrows()
+                )
+            ax.text(j + 0.5, i + 0.5, texto, ha="center", va="center", fontsize=7, color="#1A1A1A")
+
+    ax.set_xlim(0, 3)
+    ax.set_ylim(0, 3)
+    ax.set_xticks([0.5, 1.5, 2.5])
+    ax.set_xticklabels(columnas_abc)
+    ax.set_yticks([0.5, 1.5, 2.5])
+    ax.set_yticklabels(filas_xyz)
+    ax.set_xlabel("Valor / utilidad (C -> B -> A)")
+    ax.set_ylabel("Variabilidad / pronosticabilidad (X -> Y -> Z)")
+    ax.set_title("Matriz ABC-XYZ")
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150)
+    plt.close(fig)
+    return buffer.getvalue()
+
+
+def construir_reporte_pdf_gerencial(df_clasificacion: pd.DataFrame) -> bytes:
     """Reporte de una a dos paginas para gerencia: KPIs, conclusiones en
     lenguaje de negocio y las dos graficas (Pareto ABC y matriz ABC-XYZ)."""
     NAVY = colors.HexColor("#000C66")
@@ -795,7 +870,7 @@ def construir_reporte_pdf_gerencial(df_clasificacion: pd.DataFrame, fig_pareto, 
     ))
 
     elementos.append(Paragraph("Clasificacion ABC: Pareto de utilidad", estilo_h2))
-    png_pareto = fig_pareto.to_image(format="png", scale=2, width=1000, height=650)
+    png_pareto = construir_pareto_abc_png(df_clasificacion)
     elementos.append(RLImage(io.BytesIO(png_pareto), width=ancho_util, height=ancho_util * 650 / 1000))
 
     elementos.append(Paragraph("Top 5 SKU por utilidad", estilo_h2))
@@ -823,7 +898,7 @@ def construir_reporte_pdf_gerencial(df_clasificacion: pd.DataFrame, fig_pareto, 
     elementos.append(PageBreak())
 
     elementos.append(Paragraph("Matriz ABC-XYZ", estilo_h2))
-    png_matriz = fig_matriz.to_image(format="png", scale=2, width=1000, height=650)
+    png_matriz = construir_matriz_abc_xyz_png(df_clasificacion)
     elementos.append(RLImage(io.BytesIO(png_matriz), width=ancho_util, height=ancho_util * 650 / 1000))
     elementos.append(Spacer(1, 0.3 * cm))
     elementos.append(Paragraph(
@@ -1383,7 +1458,7 @@ with tab_clasificacion:
 
         st.subheader("Reporte para gerencia", icon=":material/picture_as_pdf:")
         try:
-            pdf_bytes = construir_reporte_pdf_gerencial(df_valida, fig_pareto, fig_matriz)
+            pdf_bytes = construir_reporte_pdf_gerencial(df_valida)
             st.download_button(
                 "Descargar reporte en PDF",
                 data=pdf_bytes,
