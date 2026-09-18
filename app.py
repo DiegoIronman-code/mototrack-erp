@@ -18,6 +18,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from statsforecast import StatsForecast
 from statsforecast.models import (
     HoltWinters,
@@ -30,11 +37,15 @@ from statsforecast.models import (
 # Configuracion general
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Motor de Pronosticos MotoTrack", layout="wide")
+st.set_page_config(
+    page_title="ERP MotoTrack", page_icon=":material/factory:", layout="wide"
+)
+st.logo(str(Path(__file__).resolve().parent / "assets" / "logo_mototrack.svg"), size="large")
 
 FREQ = "W-MON"
 FECHA_BASE = pd.Timestamp("2023-01-02")  # lunes de referencia para las fechas ficticias
-COLORES_PRODUCTO = {"MOTO": "salmon", "CUATRIMOTO": "navy", "TRACTOR": "darkcyan"}
+# Colores de marca (inspirados en Universidad EAFIT: azul institucional + acentos)
+COLORES_PRODUCTO = {"MOTO": "#000C66", "CUATRIMOTO": "#00A9E0", "TRACTOR": "#FF9900"}
 REGIONALES_BASE = ["NORTE", "CENTRO", "SUR"]
 
 BLOQUES_A_REGIONAL = {0: "NORTE", 1: "CENTRO", 2: "SUR"}
@@ -46,6 +57,16 @@ VENTANA_UTILIDAD_DEFAULT = 52 * 4  # 4 anios de historia para acumular la utilid
 PRECIOS_VENTA_DEFAULT = {"MOTO": 7_000_000, "CUATRIMOTO": 9_000_000, "TRACTOR": 11_000_000}
 
 TASA_INVENTARIO_DEFAULT = 17.0  # % EA, tasa de costo de mantener inventario
+
+ABC_CORTE_A_DEFAULT = 80.0  # % acumulado de utilidad hasta el cual un SKU es clase A
+ABC_CORTE_B_DEFAULT = 95.0  # % acumulado de utilidad hasta el cual un SKU es clase B
+
+# Umbrales XYZ por Score%, segun el material del curso "Gestion de Inventarios"
+# (Dhoka & Choudary, 2013): X <= 25%, 25% < Y <= 60%, Z > 60%.
+XYZ_CORTE_X_DEFAULT = 25.0
+XYZ_CORTE_Y_DEFAULT = 60.0
+
+MOSTRAR_TAB_EOQ = False  # pestana de EOQ oculta por ahora; poner en True para volver a mostrarla
 COLORES_A_PROVEEDOR = {"AZUL": "AZUL", "AMARILLO": "AMARILLO", "NEGRO": "NEGRO"}  # GRIS no se usa en este ejercicio
 
 # Carpeta donde se guarda el archivo de costos y los precios entre sesiones
@@ -500,7 +521,9 @@ def calcular_utilidad_por_sku(
     return pd.DataFrame(filas)
 
 
-def clasificar_abc(df_utilidad: pd.DataFrame, corte_a: float = 80.0, corte_b: float = 95.0) -> pd.DataFrame:
+def clasificar_abc(
+    df_utilidad: pd.DataFrame, corte_a: float = ABC_CORTE_A_DEFAULT, corte_b: float = ABC_CORTE_B_DEFAULT
+) -> pd.DataFrame:
     """Clasificacion ABC por Pareto de utilidad acumulada: A hasta corte_a%,
     B hasta corte_b%, C el resto."""
     df = df_utilidad.sort_values("UTILIDAD_TOTAL", ascending=False).reset_index(drop=True)
@@ -539,55 +562,280 @@ def clasificar_xyz(df_scores: pd.DataFrame, corte_x: float, corte_y: float) -> p
     return df
 
 
-def construir_grafica_clasificacion(df_clasificacion: pd.DataFrame):
-    """Barras de utilidad por SKU (color = clase ABC) y dispersion Score% vs
-    utilidad (color = clase XYZ), para ubicar cada SKU en la matriz ABC-XYZ."""
-    colores_abc = {"A": "seagreen", "B": "goldenrod", "C": "firebrick"}
-    colores_xyz = {"X": "seagreen", "Y": "goldenrod", "Z": "firebrick"}
-
+def construir_pareto_abc(
+    df_clasificacion: pd.DataFrame, corte_a: float = ABC_CORTE_A_DEFAULT, corte_b: float = ABC_CORTE_B_DEFAULT
+):
+    """Grafico de Pareto clasico: barras de utilidad por SKU (ordenadas de
+    mayor a menor, color = clase ABC) con la linea de % acumulado, y lineas
+    punteadas en los cortes A/B."""
+    colores_abc = {"A": "#000C66", "B": "#00A9E0", "C": "#FF9900"}
     df_barras = df_clasificacion.sort_values("UTILIDAD_TOTAL", ascending=False)
 
-    fig = make_subplots(
-        rows=1,
-        cols=2,
-        subplot_titles=["Utilidad total por SKU (color = clase ABC)", "Score% vs Utilidad (color = clase XYZ)"],
-    )
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
     fig.add_trace(
         go.Bar(
             x=df_barras["unique_id"],
             y=df_barras["UTILIDAD_TOTAL"],
             marker_color=[colores_abc.get(c, "gray") for c in df_barras["CLASE_ABC"]],
+            name="Utilidad total",
             showlegend=False,
         ),
-        row=1,
-        col=1,
+        secondary_y=False,
     )
 
-    for clase, color in colores_xyz.items():
-        sub = df_clasificacion[df_clasificacion["CLASE_XYZ"] == clase]
-        if sub.empty:
-            continue
-        fig.add_trace(
-            go.Scatter(
-                x=sub["SCORE_PORC"],
-                y=sub["UTILIDAD_TOTAL"],
-                mode="markers+text",
-                text=sub["unique_id"],
-                textposition="top center",
-                name=f"XYZ - {clase}",
-                marker=dict(color=color, size=10),
-            ),
-            row=1,
-            col=2,
+    fig.add_trace(
+        go.Scatter(
+            x=df_barras["unique_id"],
+            y=df_barras["PCT_ACUM_UTILIDAD"],
+            mode="lines+markers",
+            name="% acumulado",
+            line=dict(color="#1A1A1A"),
+            showlegend=False,
+        ),
+        secondary_y=True,
+    )
+
+    for corte in (corte_a, corte_b):
+        fig.add_hline(y=corte, line=dict(color="#57606A", dash="dot"), secondary_y=True)
+
+    fig.update_layout(template="ggplot2", height=500, title="Pareto de utilidad por SKU (clasificacion ABC)")
+    fig.update_xaxes(title_text="SKU")
+    fig.update_yaxes(title_text="Utilidad total", secondary_y=False)
+    fig.update_yaxes(title_text="% acumulado", range=[0, 105], secondary_y=True)
+    return fig
+
+
+def construir_matriz_abc_xyz(df_clasificacion: pd.DataFrame):
+    """Matriz ABC-XYZ (columnas C-B-A por valor, filas X-Y-Z por variabilidad),
+    coloreada por fila como en el material de clase: X=verde (baja
+    variabilidad), Y=amarillo (media), Z=naranja/rojo (alta). Cada celda
+    muestra los SKU que caen ahi."""
+    columnas_abc = ["C", "B", "A"]
+    filas_xyz = ["X", "Y", "Z"]
+
+    def _linea_sku(fila_sku):
+        return (
+            f"{fila_sku['unique_id']}<br>"
+            f"   Utilidad: ${fila_sku['UTILIDAD_TOTAL']:,.0f} · Score: {fila_sku['SCORE_PORC']:.1f}%"
         )
 
-    fig.update_layout(template="ggplot2", height=550)
-    fig.update_xaxes(title_text="SKU", row=1, col=1)
-    fig.update_yaxes(title_text="Utilidad total", row=1, col=1)
-    fig.update_xaxes(title_text="Score%", row=1, col=2)
-    fig.update_yaxes(title_text="Utilidad total", row=1, col=2)
+    texto = []
+    hover = []
+    for xyz in filas_xyz:
+        fila_texto, fila_hover = [], []
+        for abc in columnas_abc:
+            sub = df_clasificacion[(df_clasificacion["CLASE_ABC"] == abc) & (df_clasificacion["CLASE_XYZ"] == xyz)]
+            if sub.empty:
+                fila_texto.append("—")
+                fila_hover.append(f"Clase {abc}{xyz}: sin SKU")
+            else:
+                fila_texto.append("<br>".join(_linea_sku(r) for _, r in sub.iterrows()))
+                fila_hover.append(
+                    f"Clase {abc}{xyz} ({len(sub)} SKU)<br>" + "<br>".join(_linea_sku(r) for _, r in sub.iterrows())
+                )
+        texto.append(fila_texto)
+        hover.append(fila_hover)
+
+    z = [[1, 1, 1], [2, 2, 2], [3, 3, 3]]  # una banda de color por fila (X, Y, Z)
+    colorscale = [
+        [0.0, "#8FBF8F"], [0.333, "#8FBF8F"],
+        [0.333, "#F5C453"], [0.666, "#F5C453"],
+        [0.666, "#E2703A"], [1.0, "#E2703A"],
+    ]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            x=columnas_abc,
+            y=filas_xyz,
+            z=z,
+            zmin=1,
+            zmax=3,
+            colorscale=colorscale,
+            text=texto,
+            texttemplate="%{text}",
+            textfont=dict(size=10, color="#1A1A1A"),
+            hovertext=hover,
+            hoverinfo="text",
+            showscale=False,
+            xgap=3,
+            ygap=3,
+        )
+    )
+    fig.update_layout(
+        template="ggplot2",
+        height=480,
+        title="Matriz ABC-XYZ",
+        xaxis=dict(title="Valor / utilidad (C -> B -> A)", side="bottom"),
+        yaxis=dict(title="Variabilidad / pronosticabilidad (X -> Y -> Z)"),
+    )
     return fig
+
+
+def generar_conclusiones(df_clasificacion: pd.DataFrame) -> list:
+    """Conclusiones en lenguaje de negocio, calculadas a partir de la
+    clasificacion real (no son texto fijo)."""
+    conclusiones = []
+    total = df_clasificacion["UTILIDAD_TOTAL"].sum()
+    n_sku = len(df_clasificacion)
+
+    for clase in ["A", "B", "C"]:
+        sub = df_clasificacion[df_clasificacion["CLASE_ABC"] == clase]
+        if not sub.empty and total > 0:
+            pct = sub["UTILIDAD_TOTAL"].sum() / total * 100
+            conclusiones.append(
+                f"La clase {clase} agrupa {len(sub)} de {n_sku} SKU y concentra el {pct:.1f}% de la utilidad total."
+            )
+
+    if not df_clasificacion.empty and total > 0:
+        top = df_clasificacion.sort_values("UTILIDAD_TOTAL", ascending=False).iloc[0]
+        pct_top = top["UTILIDAD_TOTAL"] / total * 100
+        conclusiones.append(
+            f"El SKU de mayor utilidad es {top['unique_id']}, con ${top['UTILIDAD_TOTAL']:,.0f} "
+            f"({pct_top:.1f}% del total)."
+        )
+
+    riesgo = df_clasificacion[(df_clasificacion["CLASE_ABC"] == "A") & (df_clasificacion["CLASE_XYZ"] == "Z")]
+    if not riesgo.empty:
+        lista = ", ".join(riesgo["unique_id"])
+        conclusiones.append(
+            f"Atencion prioritaria: {lista} son de alto valor (clase A) pero alta variabilidad (clase Z); "
+            "conviene reforzar el pronostico y el stock de seguridad de estos SKU."
+        )
+    else:
+        conclusiones.append(
+            "Ningun SKU de clase A cae en variabilidad Z: los productos de mayor valor son "
+            "razonablemente predecibles con el modelo actual."
+        )
+
+    estables = df_clasificacion[(df_clasificacion["CLASE_ABC"] == "C") & (df_clasificacion["CLASE_XYZ"] == "X")]
+    if not estables.empty:
+        lista = ", ".join(estables["unique_id"])
+        conclusiones.append(
+            f"{lista} son de baja utilidad y baja variabilidad: se pueden manejar con tecnicas "
+            "sencillas y revisiones poco frecuentes."
+        )
+
+    return conclusiones
+
+
+def construir_reporte_pdf_gerencial(df_clasificacion: pd.DataFrame, fig_pareto, fig_matriz) -> bytes:
+    """Reporte de una a dos paginas para gerencia: KPIs, conclusiones en
+    lenguaje de negocio y las dos graficas (Pareto ABC y matriz ABC-XYZ)."""
+    NAVY = colors.HexColor("#000C66")
+    GRIS = colors.HexColor("#EDEEF6")
+    GRIS_TEXTO = colors.HexColor("#57606A")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=letter,
+        topMargin=1.2 * cm, bottomMargin=1.2 * cm, leftMargin=1.5 * cm, rightMargin=1.5 * cm,
+    )
+    ancho_util = doc.width
+
+    styles = getSampleStyleSheet()
+    estilo_titulo = ParagraphStyle("TituloReporte", parent=styles["Title"], textColor=colors.white, fontSize=22, leading=26, alignment=TA_CENTER)
+    estilo_subtitulo = ParagraphStyle("Subtitulo", parent=styles["Normal"], textColor=colors.white, fontSize=11, alignment=TA_CENTER)
+    estilo_h2 = ParagraphStyle("H2", parent=styles["Heading2"], textColor=NAVY, spaceBefore=14, spaceAfter=6)
+    estilo_body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=14)
+    estilo_bullet = ParagraphStyle("Bullet", parent=estilo_body, leftIndent=10, spaceAfter=6)
+    estilo_kpi_valor = ParagraphStyle("KpiValor", fontSize=17, textColor=NAVY, alignment=TA_CENTER, leading=20)
+    estilo_kpi_label = ParagraphStyle("KpiLabel", fontSize=9, textColor=GRIS_TEXTO, alignment=TA_CENTER)
+
+    elementos = []
+
+    encabezado = Table(
+        [
+            [Paragraph("ERP MotoTrack", estilo_titulo)],
+            [Paragraph("Reporte gerencial &mdash; Clasificacion ABC / XYZ", estilo_subtitulo)],
+            [Paragraph(pd.Timestamp.now().strftime("Generado el %d/%m/%Y"), estilo_subtitulo)],
+        ],
+        colWidths=[ancho_util],
+    )
+    encabezado.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+        ("TOPPADDING", (0, 0), (-1, 0), 16),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 16),
+        ("TOPPADDING", (0, 1), (-1, -1), 2),
+    ]))
+    elementos.append(encabezado)
+    elementos.append(Spacer(1, 0.5 * cm))
+
+    total_utilidad = df_clasificacion["UTILIDAD_TOTAL"].sum()
+    kpis = [
+        ("Utilidad total", f"${total_utilidad / 1_000_000:,.0f} MM"),
+        ("SKU analizados", str(len(df_clasificacion))),
+        ("SKU clase A", str((df_clasificacion["CLASE_ABC"] == "A").sum())),
+        ("SKU clase Z", str((df_clasificacion["CLASE_XYZ"] == "Z").sum())),
+    ]
+    ancho_kpi = ancho_util / len(kpis)
+    celdas_kpi = []
+    for etiqueta, valor in kpis:
+        celda = Table(
+            [[Paragraph(f"<b>{valor}</b>", estilo_kpi_valor)], [Paragraph(etiqueta, estilo_kpi_label)]],
+            colWidths=[ancho_kpi - 0.2 * cm],
+        )
+        celda.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), GRIS),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ]))
+        celdas_kpi.append(celda)
+    tabla_kpis = Table([celdas_kpi], colWidths=[ancho_kpi] * len(kpis))
+    tabla_kpis.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3)]))
+    elementos.append(tabla_kpis)
+
+    elementos.append(Paragraph("Conclusiones clave", estilo_h2))
+    for conclusion in generar_conclusiones(df_clasificacion):
+        elementos.append(Paragraph(f"&bull; {conclusion}", estilo_bullet))
+    elementos.append(Paragraph(
+        "Metodologia: ABC por utilidad acumulada (Pareto, cortes 80%/95%); XYZ por Score% del pronostico "
+        "(X &le; 25%, 25% &lt; Y &le; 60%, Z &gt; 60%), siguiendo Dhoka &amp; Choudary (2013).",
+        ParagraphStyle("Metodologia", parent=estilo_body, fontSize=8, textColor=GRIS_TEXTO, spaceBefore=4),
+    ))
+
+    elementos.append(Paragraph("Clasificacion ABC: Pareto de utilidad", estilo_h2))
+    png_pareto = fig_pareto.to_image(format="png", scale=2, width=1000, height=650)
+    elementos.append(RLImage(io.BytesIO(png_pareto), width=ancho_util, height=ancho_util * 650 / 1000))
+
+    elementos.append(Paragraph("Top 5 SKU por utilidad", estilo_h2))
+    top5 = df_clasificacion.sort_values("UTILIDAD_TOTAL", ascending=False).head(5)
+    filas_top5 = [["SKU", "Utilidad", "Clase ABC", "Score%", "Clase XYZ"]]
+    for _, fila in top5.iterrows():
+        filas_top5.append([
+            fila["unique_id"], f"${fila['UTILIDAD_TOTAL']:,.0f}",
+            fila["CLASE_ABC"], f"{fila['SCORE_PORC']:.1f}%", fila["CLASE_XYZ"],
+        ])
+    tabla_top5 = Table(filas_top5, colWidths=[ancho_util * w for w in (0.32, 0.28, 0.15, 0.13, 0.12)])
+    tabla_top5.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, GRIS]),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D3D4D9")),
+        ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    elementos.append(tabla_top5)
+
+    elementos.append(PageBreak())
+
+    elementos.append(Paragraph("Matriz ABC-XYZ", estilo_h2))
+    png_matriz = fig_matriz.to_image(format="png", scale=2, width=1000, height=650)
+    elementos.append(RLImage(io.BytesIO(png_matriz), width=ancho_util, height=ancho_util * 650 / 1000))
+    elementos.append(Spacer(1, 0.3 * cm))
+    elementos.append(Paragraph(
+        "<b>Z</b> (alta variabilidad): validar productos nuevos y estacionalidad, usar tecnicas mas avanzadas "
+        "(modelos predictivos, ML). <b>Y</b> (variabilidad media): revisiones mas frecuentes. "
+        "<b>X</b> (baja variabilidad): tecnicas sencillas, revisiones menos frecuentes. "
+        "<b>Columna C</b>: SKU poco importantes por utilidad, revisiones poco frecuentes sin importar su variabilidad.",
+        estilo_body,
+    ))
+
+    doc.build(elementos)
+    return buffer.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -840,15 +1088,65 @@ def construir_grafica_eoq(df_eoq: pd.DataFrame):
 # Interfaz de Streamlit
 # ---------------------------------------------------------------------------
 
-st.title("ERP MotoTrack")
+st.html("""
+<style>
+.st-key-header_banner {
+    background-color: #000C66;
+    padding: 1.25rem 1.5rem;
+    border-radius: 8px;
+    margin-bottom: 1rem;
+}
+.st-key-header_banner * {
+    color: #FFFFFF !important;
+    fill: #FFFFFF !important;
+}
+.st-key-tabs_principales [role="tablist"] {
+    background-color: transparent;
+    border-bottom: none;
+    gap: 0.75rem;
+    padding: 0;
+}
+.st-key-tabs_principales [role="tab"] {
+    color: #000C66 !important;
+    background-color: #EDEEF6;
+    border-radius: 999px;
+    padding: 0.55rem 1.25rem;
+}
+.st-key-tabs_principales [role="tab"] svg {
+    fill: #000C66 !important;
+}
+.st-key-tabs_principales [role="tab"][aria-selected="true"] {
+    background-color: #000C66;
+    color: #FFFFFF !important;
+}
+.st-key-tabs_principales [role="tab"][aria-selected="true"] svg {
+    fill: #FFFFFF !important;
+}
+.st-key-tabs_principales .react-aria-SelectionIndicator {
+    display: none;
+}
+</style>
+""")
+with st.container(key="header_banner"):
+    st.title("ERP MotoTrack", icon=":material/factory:")
 
-tab_pronostico, tab_clasificacion, tab_eoq = st.tabs(
-    ["Pronostico de demanda", "Clasificacion ABC y XYZ", "EOQ de materias primas"]
-)
+if MOSTRAR_TAB_EOQ:
+    tab_pronostico, tab_clasificacion, tab_eoq = st.tabs(
+        [":material/trending_up: Pronostico de demanda",
+         ":material/inventory_2: Clasificacion ABC y XYZ",
+         ":material/local_shipping: EOQ de materias primas"],
+        key="tabs_principales",
+    )
+else:
+    tab_pronostico, tab_clasificacion = st.tabs(
+        [":material/trending_up: Pronostico de demanda",
+         ":material/inventory_2: Clasificacion ABC y XYZ"],
+        key="tabs_principales",
+    )
 
 # ---- Pestana 1: Pronostico de demanda -------------------------------------
 with tab_pronostico:
-    st.header("Motor de Pronosticos MotoTrack")
+    st.header("Motor de Pronosticos MotoTrack", icon=":material/trending_up:")
     st.write(
         "Carga el historico de demanda, compara modelos mediante backtesting "
         "y obten el pronostico del mejor modelo para cada serie."
@@ -899,7 +1197,7 @@ with tab_pronostico:
                     f"Detalle: {e}"
                 )
 
-    generar = st.button("Generar pronostico")
+    generar = st.button("Generar pronostico", icon=":material/play_arrow:", type="primary")
 
     if generar:
         if "df_long" not in st.session_state:
@@ -921,8 +1219,8 @@ with tab_pronostico:
                 st.session_state["errores"] = errores_cv + errores_fcst
 
     if "tabla_resumen" in st.session_state:
-        st.subheader("Tabla resumen")
-        st.dataframe(st.session_state["tabla_resumen"], use_container_width=True)
+        st.subheader("Tabla resumen", icon=":material/table_chart:")
+        st.dataframe(st.session_state["tabla_resumen"], width="stretch")
 
         excel_bytes = df_a_excel_bytes(st.session_state["tabla_resumen"])
         st.download_button(
@@ -930,10 +1228,11 @@ with tab_pronostico:
             data=excel_bytes,
             file_name="resumen_pronostico_mototrack.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
         )
 
-        st.subheader("Grafica")
-        st.plotly_chart(st.session_state["fig"], use_container_width=True)
+        st.subheader("Grafica", icon=":material/bar_chart:")
+        st.plotly_chart(st.session_state["fig"], width="stretch")
 
         if st.session_state.get("errores"):
             with st.expander(f"Avisos durante el calculo ({len(st.session_state['errores'])})"):
@@ -942,7 +1241,7 @@ with tab_pronostico:
 
 # ---- Pestana 2: Clasificacion ABC y XYZ ------------------------------------
 with tab_clasificacion:
-    st.header("Clasificacion ABC y XYZ MotoTrack")
+    st.header("Clasificacion ABC y XYZ MotoTrack", icon=":material/inventory_2:")
     st.write(
         "Carga los costos por producto (hoja 'Costos'), ajusta el precio de "
         "venta y obten la clasificacion ABC (por utilidad) y XYZ (por Score% "
@@ -987,13 +1286,21 @@ with tab_clasificacion:
     )
 
     st.subheader("Umbrales XYZ (Score%)")
+    st.caption(
+        "Por defecto X <= 25%, 25% < Y <= 60%, Z > 60%, segun los limites de Score% "
+        "del curso (Dhoka & Choudary, 2013). Ajustalos si tus datos lo requieren."
+    )
     col_x, col_y = st.columns(2)
     with col_x:
-        umbral_x = st.number_input("X: Score% menor o igual a", min_value=0.0, value=10.0, step=1.0, key="umbral_xyz_x")
+        umbral_x = st.number_input(
+            "X: Score% menor o igual a", min_value=0.0, value=XYZ_CORTE_X_DEFAULT, step=1.0, key="umbral_xyz_x"
+        )
     with col_y:
-        umbral_y = st.number_input("Y: Score% menor o igual a", min_value=0.0, value=20.0, step=1.0, key="umbral_xyz_y")
+        umbral_y = st.number_input(
+            "Y: Score% menor o igual a", min_value=0.0, value=XYZ_CORTE_Y_DEFAULT, step=1.0, key="umbral_xyz_y"
+        )
 
-    generar_clasificacion = st.button("Generar clasificacion ABC o XYZ")
+    generar_clasificacion = st.button("Generar clasificacion ABC o XYZ", icon=":material/play_arrow:", type="primary")
 
     if generar_clasificacion:
         faltantes = []
@@ -1033,13 +1340,13 @@ with tab_clasificacion:
     if "df_clasificacion" in st.session_state:
         df_clasificacion = st.session_state["df_clasificacion"]
 
-        st.subheader("Tabla de clasificacion")
+        st.subheader("Tabla de clasificacion", icon=":material/table_chart:")
         columnas_mostrar = [
             "REGIONAL", "PRODUCTO", "CANTIDAD_VENTANA", "PRECIO", "COSTO",
             "MARGEN_UNITARIO", "UTILIDAD_TOTAL", "PCT_ACUM_UTILIDAD", "CLASE_ABC",
             "SCORE_PORC", "RMSE", "CLASE_XYZ",
         ]
-        st.dataframe(df_clasificacion[columnas_mostrar], use_container_width=True)
+        st.dataframe(df_clasificacion[columnas_mostrar], width="stretch")
 
         excel_bytes_clasificacion = df_a_excel_bytes(df_clasificacion[columnas_mostrar])
         st.download_button(
@@ -1047,6 +1354,7 @@ with tab_clasificacion:
             data=excel_bytes_clasificacion,
             file_name="clasificacion_abc_xyz_mototrack.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
         )
 
         if df_clasificacion["CLASE_XYZ"].isna().any():
@@ -1056,72 +1364,102 @@ with tab_clasificacion:
                 f"correr 'Generar pronostico'): {', '.join(sin_score)}"
             )
 
-        st.subheader("Grafica")
-        st.plotly_chart(construir_grafica_clasificacion(df_clasificacion.dropna(subset=["CLASE_XYZ"])), use_container_width=True)
+        df_valida = df_clasificacion.dropna(subset=["CLASE_XYZ"])
+        fig_pareto = construir_pareto_abc(df_valida)
+        fig_matriz = construir_matriz_abc_xyz(df_valida)
 
-# ---- Pestana 3: EOQ de materias primas -------------------------------------
-with tab_eoq:
-    st.header("EOQ de Materias Primas MotoTrack")
-    st.write(
-        "Calcula la cantidad economica de pedido (EOQ) de cada materia prima, "
-        "a partir de la demanda anual de MOTOTRAK (traducida via la lista de "
-        "materiales), el costo de mantener inventario y el costo de "
-        "transporte de cada proveedor."
-    )
+        st.subheader("Pareto ABC", icon=":material/bar_chart:")
+        st.plotly_chart(fig_pareto, width="stretch")
 
-    tasa_inventario = st.number_input(
-        "Tasa de inventario anual (% EA)",
-        min_value=0.0, value=TASA_INVENTARIO_DEFAULT, step=0.5, key="tasa_inventario",
-    )
-
-    generar_eoq = st.button("Generar EOQ")
-
-    if generar_eoq:
-        faltantes = []
-        if "df_long_completo" not in st.session_state:
-            faltantes.append("subir el archivo de demanda en la pestana 'Pronostico de demanda'")
-        if not all(k in st.session_state for k in ("bom", "materias_primas", "transporte")):
-            faltantes.append(
-                "volver a subir el archivo de demanda (no se pudo leer 'Products & Materials' / 'Transportation')"
-            )
-        if not COSTOS_PATH.exists():
-            faltantes.append("subir un archivo de costos valido en la pestana de clasificacion")
-
-        if faltantes:
-            st.error("Antes de calcular el EOQ, falta: " + "; ".join(faltantes) + ".")
-        else:
-            try:
-                precios_mp = extraer_precio_materias_primas(COSTOS_PATH)
-            except Exception as e:
-                precios_mp = None
-                st.error(f"No se pudo leer los precios de materia prima de la hoja 'Costos'. Detalle: {e}")
-
-            if precios_mp is not None:
-                demanda_anual = calcular_demanda_anual_materia_prima(
-                    st.session_state["df_long_completo"], st.session_state["bom"]
-                )
-                df_eoq = calcular_eoq_materias_primas(
-                    demanda_anual,
-                    precios_mp,
-                    st.session_state["materias_primas"],
-                    st.session_state["transporte"],
-                    tasa_inventario,
-                )
-                st.session_state["df_eoq"] = df_eoq
-
-    if "df_eoq" in st.session_state:
-        df_eoq = st.session_state["df_eoq"]
-
-        st.subheader("Tabla EOQ")
-        st.dataframe(df_eoq, use_container_width=True)
-
-        excel_bytes_eoq = df_a_excel_bytes(df_eoq)
-        st.download_button(
-            "Descargar EOQ en Excel",
-            data=excel_bytes_eoq,
-            file_name="eoq_materias_primas_mototrack.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        st.subheader("Matriz ABC-XYZ", icon=":material/grid_view:")
+        st.plotly_chart(fig_matriz, width="stretch")
+        st.caption(
+            "**Z** (alta variabilidad): validar productos nuevos y estacionalidad; usar tecnicas mas avanzadas "
+            "(modelos predictivos, ML).  \n"
+            "**Y** (variabilidad media): validar estacionalidad, tecnicas mas sofisticadas, revisiones mas frecuentes.  \n"
+            "**X** (baja variabilidad): tecnicas sencillas, revisiones menos frecuentes.  \n"
+            "**Columna C**: SKU poco importantes por utilidad, revisiones poco frecuentes sin importar su variabilidad."
         )
 
-        st.subheader("Grafica")
-        st.plotly_chart(construir_grafica_eoq(df_eoq), use_container_width=True)
+        st.subheader("Reporte para gerencia", icon=":material/picture_as_pdf:")
+        try:
+            pdf_bytes = construir_reporte_pdf_gerencial(df_valida, fig_pareto, fig_matriz)
+            st.download_button(
+                "Descargar reporte en PDF",
+                data=pdf_bytes,
+                file_name="reporte_gerencial_abc_xyz_mototrack.pdf",
+                mime="application/pdf",
+                icon=":material/download:",
+                type="primary",
+            )
+        except Exception as e:
+            st.error(f"No se pudo generar el reporte PDF. Detalle: {e}")
+
+# ---- Pestana 3: EOQ de materias primas (oculta por ahora, ver MOSTRAR_TAB_EOQ) --
+if MOSTRAR_TAB_EOQ:
+    with tab_eoq:
+        st.header("EOQ de Materias Primas MotoTrack", icon=":material/local_shipping:")
+        st.write(
+            "Calcula la cantidad economica de pedido (EOQ) de cada materia prima, "
+            "a partir de la demanda anual de MOTOTRAK (traducida via la lista de "
+            "materiales), el costo de mantener inventario y el costo de "
+            "transporte de cada proveedor."
+        )
+
+        tasa_inventario = st.number_input(
+            "Tasa de inventario anual (% EA)",
+            min_value=0.0, value=TASA_INVENTARIO_DEFAULT, step=0.5, key="tasa_inventario",
+        )
+
+        generar_eoq = st.button("Generar EOQ", icon=":material/play_arrow:", type="primary")
+
+        if generar_eoq:
+            faltantes = []
+            if "df_long_completo" not in st.session_state:
+                faltantes.append("subir el archivo de demanda en la pestana 'Pronostico de demanda'")
+            if not all(k in st.session_state for k in ("bom", "materias_primas", "transporte")):
+                faltantes.append(
+                    "volver a subir el archivo de demanda (no se pudo leer 'Products & Materials' / 'Transportation')"
+                )
+            if not COSTOS_PATH.exists():
+                faltantes.append("subir un archivo de costos valido en la pestana de clasificacion")
+
+            if faltantes:
+                st.error("Antes de calcular el EOQ, falta: " + "; ".join(faltantes) + ".")
+            else:
+                try:
+                    precios_mp = extraer_precio_materias_primas(COSTOS_PATH)
+                except Exception as e:
+                    precios_mp = None
+                    st.error(f"No se pudo leer los precios de materia prima de la hoja 'Costos'. Detalle: {e}")
+
+                if precios_mp is not None:
+                    demanda_anual = calcular_demanda_anual_materia_prima(
+                        st.session_state["df_long_completo"], st.session_state["bom"]
+                    )
+                    df_eoq = calcular_eoq_materias_primas(
+                        demanda_anual,
+                        precios_mp,
+                        st.session_state["materias_primas"],
+                        st.session_state["transporte"],
+                        tasa_inventario,
+                    )
+                    st.session_state["df_eoq"] = df_eoq
+
+        if "df_eoq" in st.session_state:
+            df_eoq = st.session_state["df_eoq"]
+
+            st.subheader("Tabla EOQ", icon=":material/table_chart:")
+            st.dataframe(df_eoq, width="stretch")
+
+            excel_bytes_eoq = df_a_excel_bytes(df_eoq)
+            st.download_button(
+                "Descargar EOQ en Excel",
+                data=excel_bytes_eoq,
+                file_name="eoq_materias_primas_mototrack.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                icon=":material/download:",
+            )
+
+            st.subheader("Grafica", icon=":material/bar_chart:")
+            st.plotly_chart(construir_grafica_eoq(df_eoq), width="stretch")

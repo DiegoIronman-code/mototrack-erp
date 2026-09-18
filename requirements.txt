@@ -4,3 +4,5 @@ numpy
 plotly
 statsforecast>=1.6.0
 openpyxl
+reportlab
+kaleido

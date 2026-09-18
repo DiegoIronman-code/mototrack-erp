@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 90" width="360" height="90">
+  <g>
+    <!-- Rueda / icono -->
+    <circle cx="45" cy="45" r="34" fill="none" stroke="#000C66" stroke-width="10"/>
+    <circle cx="45" cy="45" r="10" fill="#000C66"/>
+    <path d="M45 45 L74 30" stroke="#00A9E0" stroke-width="8" stroke-linecap="round"/>
+    <path d="M45 45 L20 62" stroke="#FF9900" stroke-width="8" stroke-linecap="round"/>
+    <!-- Lineas de velocidad -->
+    <path d="M4 20 L26 20" stroke="#00A9E0" stroke-width="6" stroke-linecap="round"/>
+    <path d="M0 32 L18 32" stroke="#00A9E0" stroke-width="6" stroke-linecap="round" opacity="0.6"/>
+  </g>
+  <text x="96" y="58" font-family="Inter, Arial, sans-serif" font-size="42" font-weight="700" fill="#000C66">Moto<tspan fill="#00A9E0">Track</tspan></text>
+</svg>

@@ -1,2 +1,30 @@
 [server]
 showEmailPrompt = false
+
+[theme]
+base = "light"
+primaryColor = "#000C66"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#EDEEF6"
+textColor = "#1A1A1A"
+linkColor = "#000C66"
+borderColor = "#D3D4D9"
+
+blueColor = "#00A9E0"
+orangeColor = "#FF9900"
+
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+baseFontSize = 15
+baseFontWeight = 400
+headingFontWeights = [700, 700, 600, 600, 500, 500]
+linkUnderline = false
+
+baseRadius = "8px"
+buttonRadius = "8px"
+showWidgetBorder = true
+
+chartCategoricalColors = ["#000C66", "#00A9E0", "#FF9900", "#5A5FC7", "#17A673", "#C8102E", "#57606A"]
+
+dataframeBorderColor = "#D3D4D9"
+dataframeHeaderBackgroundColor = "#EDEEF6"
