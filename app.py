@@ -223,6 +223,9 @@ def ejecutar_backtesting(df_ts: pd.DataFrame, n_windows: int, h: int):
 
 def calcular_metricas(df_cv: pd.DataFrame) -> pd.DataFrame:
     """Calcula MAE%, Sesgo%, Score% y RMSE por serie y por modelo."""
+    if df_cv.empty:
+        return pd.DataFrame()
+
     columnas_meta = {"unique_id", "ds", "cutoff", "y"}
     columnas_modelo = [c for c in df_cv.columns if c not in columnas_meta]
 
@@ -1283,6 +1286,16 @@ with tab_pronostico:
                 df_ts = a_formato_statsforecast(df_long)
 
                 df_cv, errores_cv, modelos = ejecutar_backtesting(df_ts, int(n_windows), int(h))
+
+            if df_cv.empty:
+                st.error(
+                    "Ningun modelo pudo entrenarse con este archivo: probablemente el historico de "
+                    "demanda es muy corto para los parametros actuales (n_windows="
+                    f"{int(n_windows)}, h={int(h)}; algunos modelos tambien necesitan al menos 13 "
+                    "semanas por su estacionalidad). Sube un archivo con mas turnos, o reduce "
+                    "n_windows/h, y vuelve a intentar."
+                )
+            else:
                 df_metricas = calcular_metricas(df_cv)
                 ganadores = elegir_mejor_modelo(df_metricas)
                 df_forecast, errores_fcst = generar_pronostico_final(df_ts, ganadores, modelos, int(h))
