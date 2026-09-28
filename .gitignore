@@ -2,5 +2,10 @@
 __pycache__/
 *.pyc
 
-# Costos y precios subidos por el equipo: son datos del negocio, no van al repo.
-data/
+# precios_venta.json y el historico de Revision Periodica son overrides de
+# sesion (los precios por defecto ya estan en el codigo); no van al repo.
+# costos_actual.xlsx SI se versiona a proposito: sin el, Streamlit Cloud
+# vuelve a pedirlo cada vez que el contenedor se reinicia (su disco no es
+# persistente entre despliegues/reinicios).
+data/*
+!data/costos_actual.xlsx
