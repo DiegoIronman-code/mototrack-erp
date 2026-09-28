@@ -21,6 +21,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from scipy.stats import norm
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import letter
@@ -72,12 +73,20 @@ XYZ_CORTE_Y_DEFAULT = 60.0
 MOSTRAR_TAB_EOQ = False  # pestana de EOQ oculta por ahora; poner en True para volver a mostrarla
 COLORES_A_PROVEEDOR = {"AZUL": "AZUL", "AMARILLO": "AMARILLO", "NEGRO": "NEGRO"}  # GRIS no se usa en este ejercicio
 
+# Sedes que entran en la revision periodica (R,S): a diferencia de la
+# clasificacion ABC/XYZ, aqui SI se incluye CEDI porque en el juego es un
+# punto de inventario fisico real (recibe de Fabrica y despacha a Centro/Sur).
+REGIONALES_RS = ["NORTE", "CENTRO", "SUR", "CEDI"]
+R_REVISION_DEFAULT = 1  # turnos entre revisiones (revision semanal)
+NSC_DEFAULT = 95.0  # nivel de servicio de ciclo (%) para el stock de seguridad
+
 # Carpeta donde se guarda el archivo de costos y los precios entre sesiones
 # (sin base de datos: son archivos planos que se sobreescriben al actualizar).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 COSTOS_PATH = DATA_DIR / "costos_actual.xlsx"
 PRECIOS_PATH = DATA_DIR / "precios_venta.json"
+HISTORICO_RS_PATH = DATA_DIR / "historico_revision_periodica.csv"
 
 
 def construir_modelos():
@@ -1163,6 +1172,282 @@ def construir_grafica_eoq(df_eoq: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# 7. Revision periodica (R,S): S_max, fill rate esperado, rotacion y GMROI
+# ---------------------------------------------------------------------------
+
+def extraer_lead_times_internos(archivo) -> dict:
+    """Lee la hoja 'Transportation' y devuelve, para cada sede real (incluido
+    CEDI), el lead time (en turnos) hacia su proveedor inmediato: Norte y
+    CEDI se abastecen directo de la Fabrica; Centro y Sur se abastecen del
+    CEDI. Se lee de los datos, no se asume un valor fijo."""
+    archivo.seek(0)
+    df = pd.read_excel(archivo, sheet_name="Transportation")
+    destino = df["Destiny"].astype(str).str.lower()
+
+    lead_times = {}
+    for regional in REGIONALES_RS:
+        fila = df[destino.str.contains(regional.lower())]
+        if not fila.empty:
+            lead_times[regional] = int(fila.iloc[0]["Turns To Destination"])
+    return lead_times
+
+
+def calcular_revision_periodica(
+    tabla_resumen: pd.DataFrame, lead_times: dict, r_revision: int, nsc_pct: float
+) -> pd.DataFrame:
+    """Calcula, para cada SKU real (Norte/Centro/Sur/CEDI x producto), el
+    stock de seguridad, el S_max de la revision periodica (R,S) y el fill
+    rate esperado, con la formula del vendedor de periodicos:
+
+        S = Suma(pronostico, R+L) + k * RMSE * raiz(R+L)
+        Fill Rate = 1 - RMSE * raiz(R+L) * G(k) / Suma(pronostico, R+L)
+
+    donde k = NORM.S.INV(NSC) y G(k) es la funcion de perdida normal unitaria.
+    """
+    if tabla_resumen.empty:
+        return pd.DataFrame()
+
+    k = norm.ppf(nsc_pct / 100)
+    g_k = norm.pdf(k) - k * (1 - norm.cdf(k))
+
+    turnos_cols = sorted(
+        (c for c in tabla_resumen.columns if c.startswith("Turno ")),
+        key=lambda c: int(c.split(" ")[1]),
+    )
+
+    filas = []
+    for _, fila in tabla_resumen.iterrows():
+        regional = fila["REGIONAL"]
+        if regional not in REGIONALES_RS:
+            continue
+        L = lead_times.get(regional)
+        if L is None:
+            continue
+
+        proteccion = int(r_revision) + int(L)
+        cols_proteccion = turnos_cols[:proteccion]
+        if len(cols_proteccion) < proteccion:
+            continue  # el pronostico (h) no alcanza a cubrir R+L turnos
+
+        demanda_proteccion = float(sum(fila[c] for c in cols_proteccion))
+        demanda_r = float(sum(fila[c] for c in turnos_cols[: int(r_revision)]))
+        rmse = float(fila["RMSE"])
+
+        stock_seguridad = k * rmse * np.sqrt(proteccion)
+        s_max = demanda_proteccion + stock_seguridad
+        inventario_promedio_und = demanda_r / 2 + stock_seguridad
+        perdida_esperada = rmse * np.sqrt(proteccion) * g_k
+
+        fill_rate = (
+            1 - perdida_esperada / demanda_proteccion if demanda_proteccion > 0 else np.nan
+        )
+        if pd.notna(fill_rate):
+            fill_rate = min(max(fill_rate, 0.0), 1.0)
+
+        filas.append(
+            {
+                "REGIONAL": regional,
+                "PRODUCTO": fila["PRODUCTO"],
+                "unique_id": f"{regional}|{fila['PRODUCTO']}",
+                "MODELO": fila["MODELO"],
+                "RMSE": round(rmse, 2),
+                "R": int(r_revision),
+                "L": int(L),
+                "R_MAS_L": proteccion,
+                "DEMANDA_R_MAS_L": round(demanda_proteccion, 1),
+                "STOCK_SEGURIDAD": round(stock_seguridad, 1),
+                "S_MAX": round(s_max, 1),
+                "INVENTARIO_PROMEDIO_UND": round(inventario_promedio_und, 1),
+                "PERDIDA_ESPERADA_UND": round(perdida_esperada, 2),
+                "FILL_RATE_ESPERADO_PCT": round(fill_rate * 100, 2) if pd.notna(fill_rate) else np.nan,
+            }
+        )
+
+    return pd.DataFrame(filas)
+
+
+def calcular_demanda_anual_real(df_long_completo: pd.DataFrame, regionales: list) -> pd.DataFrame:
+    """Demanda real de las ultimas 52 semanas (VENTANA_SEMANAS), por sede y
+    producto, para las sedes indicadas (incluye CEDI si se pide)."""
+    ventana = aplicar_ventana_movil(df_long_completo, semanas=VENTANA_SEMANAS)
+    ventana = ventana[ventana["REGIONAL"].isin(regionales)]
+    return (
+        ventana.groupby(["REGIONAL", "PRODUCTO"], as_index=False)["DEMANDA"]
+        .sum()
+        .rename(columns={"DEMANDA": "DEMANDA_ANUAL"})
+    )
+
+
+def calcular_rotacion_gmroi(
+    df_rs: pd.DataFrame,
+    demanda_anual_real: pd.DataFrame,
+    costos_por_producto: pd.DataFrame,
+    precios_por_producto: dict,
+) -> pd.DataFrame:
+    """Agrega, a la tabla de revision periodica, la rotacion de inventarios y
+    el GMROI de cada SKU, usando el inventario promedio del modelo (R,S) y
+    la demanda anual real (no la de R+L turnos, que es muy corta)."""
+    costos_dict = costos_por_producto.set_index("PRODUCTO")["COSTO_UNITARIO"].to_dict()
+
+    df = df_rs.merge(demanda_anual_real, on=["REGIONAL", "PRODUCTO"], how="left")
+
+    filas = []
+    for _, fila in df.iterrows():
+        producto = fila["PRODUCTO"]
+        costo = costos_dict.get(producto)
+        precio = precios_por_producto.get(producto)
+        demanda_anual = fila["DEMANDA_ANUAL"]
+        if costo is None or precio is None or pd.isna(demanda_anual):
+            continue
+
+        inventario_promedio_valor = fila["INVENTARIO_PROMEDIO_UND"] * costo
+        ventas_anuales_costo = demanda_anual * costo
+        utilidad_bruta_anual = demanda_anual * (precio - costo)
+
+        rotacion = ventas_anuales_costo / inventario_promedio_valor if inventario_promedio_valor > 0 else np.nan
+        gmroi = utilidad_bruta_anual / inventario_promedio_valor if inventario_promedio_valor > 0 else np.nan
+
+        registro = fila.to_dict()
+        registro.update(
+            {
+                "DEMANDA_ANUAL": round(demanda_anual, 1),
+                "INVENTARIO_PROMEDIO_VALOR": round(inventario_promedio_valor, 0),
+                "VENTAS_ANUALES_COSTO": round(ventas_anuales_costo, 0),
+                "UTILIDAD_BRUTA_ANUAL": round(utilidad_bruta_anual, 0),
+                "ROTACION": round(rotacion, 2) if pd.notna(rotacion) else np.nan,
+                "GMROI": round(gmroi, 2) if pd.notna(gmroi) else np.nan,
+            }
+        )
+        filas.append(registro)
+
+    return pd.DataFrame(filas)
+
+
+def guardar_historico_rs(df_rs: pd.DataFrame, turno_max: int) -> None:
+    """Agrega (o reemplaza) el snapshot de este turno en el historico de
+    revision periodica persistido en disco, para poder graficar como
+    evoluciona el fill rate esperado turno a turno mientras se sigue jugando."""
+    snapshot = df_rs[["unique_id", "REGIONAL", "PRODUCTO", "FILL_RATE_ESPERADO_PCT", "DEMANDA_R_MAS_L", "PERDIDA_ESPERADA_UND"]].copy()
+    snapshot["TURNO"] = turno_max
+
+    if HISTORICO_RS_PATH.exists():
+        previo = pd.read_csv(HISTORICO_RS_PATH)
+        previo = previo[previo["TURNO"] != turno_max]  # si se recalcula el mismo turno, se reemplaza
+        historico = pd.concat([previo, snapshot], ignore_index=True)
+    else:
+        historico = snapshot
+
+    historico.to_csv(HISTORICO_RS_PATH, index=False)
+
+
+def cargar_historico_rs() -> pd.DataFrame:
+    if HISTORICO_RS_PATH.exists():
+        return pd.read_csv(HISTORICO_RS_PATH)
+    return pd.DataFrame()
+
+
+def construir_grafica_fill_rate(df_rs: pd.DataFrame, nsc_pct: float):
+    """Barras del fill rate esperado por SKU (color = producto), con una
+    linea horizontal en el NSC objetivo."""
+    fig = go.Figure()
+    for producto, color in COLORES_PRODUCTO.items():
+        sub = df_rs[df_rs["PRODUCTO"] == producto]
+        if sub.empty:
+            continue
+        fig.add_trace(
+            go.Bar(x=sub["unique_id"], y=sub["FILL_RATE_ESPERADO_PCT"], name=producto, marker_color=color)
+        )
+
+    fig.add_hline(y=nsc_pct, line=dict(color="#57606A", dash="dot"))
+    fig.update_layout(template="ggplot2", height=450, title="Fill Rate esperado por SKU", barmode="group")
+    fig.update_xaxes(title_text="SKU")
+    fig.update_yaxes(title_text="Fill Rate esperado (%)", range=[0, 105])
+    return fig
+
+
+def construir_grafica_historico_fill_rate(df_historico: pd.DataFrame):
+    """Evolucion del fill rate esperado por SKU y del global (ponderado por
+    demanda) a lo largo de los turnos jugados."""
+    fig = go.Figure()
+    for unique_id, serie in df_historico.groupby("unique_id"):
+        serie = serie.sort_values("TURNO")
+        fig.add_trace(
+            go.Scatter(
+                x=serie["TURNO"], y=serie["FILL_RATE_ESPERADO_PCT"], mode="lines+markers",
+                name=unique_id, opacity=0.5, line=dict(width=1),
+            )
+        )
+
+    global_por_turno = (
+        df_historico.groupby("TURNO", as_index=False)[["PERDIDA_ESPERADA_UND", "DEMANDA_R_MAS_L"]]
+        .sum()
+        .sort_values("TURNO")
+    )
+    global_por_turno["FILL_RATE_GLOBAL"] = (
+        1 - global_por_turno["PERDIDA_ESPERADA_UND"] / global_por_turno["DEMANDA_R_MAS_L"]
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=global_por_turno["TURNO"], y=global_por_turno["FILL_RATE_GLOBAL"] * 100,
+            mode="lines+markers", name="GLOBAL", line=dict(color="#000C66", width=3),
+        )
+    )
+
+    fig.update_layout(template="ggplot2", height=450, title="Fill Rate esperado por turno jugado")
+    fig.update_xaxes(title_text="Turno")
+    fig.update_yaxes(title_text="Fill Rate esperado (%)", range=[0, 105])
+    return fig
+
+
+def generar_conclusiones_rs(df_rs: pd.DataFrame) -> list:
+    """Conclusiones en lenguaje de negocio sobre el Fill Rate esperado (global
+    y por regional) y la comparacion de rotacion/GMROI entre referencias."""
+    conclusiones = []
+
+    fill_global = 1 - df_rs["PERDIDA_ESPERADA_UND"].sum() / df_rs["DEMANDA_R_MAS_L"].sum()
+    conclusiones.append(
+        f"El Fill Rate esperado global (las {len(df_rs)} referencias juntas) es {fill_global * 100:.1f}%."
+    )
+
+    agregado_regional = df_rs.groupby("REGIONAL")[["PERDIDA_ESPERADA_UND", "DEMANDA_R_MAS_L"]].sum()
+    agregado_regional["FILL_RATE"] = 1 - agregado_regional["PERDIDA_ESPERADA_UND"] / agregado_regional["DEMANDA_R_MAS_L"]
+    agregado_regional = agregado_regional.sort_values("FILL_RATE")
+    if len(agregado_regional) > 1:
+        peor_regional, mejor_regional = agregado_regional.index[0], agregado_regional.index[-1]
+        conclusiones.append(
+            f"Por regional, el Fill Rate esperado va de {agregado_regional['FILL_RATE'].min() * 100:.1f}% "
+            f"({peor_regional}) a {agregado_regional['FILL_RATE'].max() * 100:.1f}% ({mejor_regional})."
+        )
+
+    peor_sku = df_rs.loc[df_rs["FILL_RATE_ESPERADO_PCT"].idxmin()]
+    conclusiones.append(
+        f"La referencia con menor Fill Rate esperado es {peor_sku['unique_id']} "
+        f"({peor_sku['FILL_RATE_ESPERADO_PCT']:.1f}%); conviene revisar su RMSE (variabilidad del pronostico) "
+        "o subir su nivel de servicio objetivo."
+    )
+
+    if df_rs["ROTACION"].notna().any():
+        mejor_rot = df_rs.loc[df_rs["ROTACION"].idxmax()]
+        peor_rot = df_rs.loc[df_rs["ROTACION"].idxmin()]
+        conclusiones.append(
+            f"La referencia con mayor rotacion es {mejor_rot['unique_id']} ({mejor_rot['ROTACION']:.1f} veces/anio) "
+            f"y la de menor rotacion es {peor_rot['unique_id']} ({peor_rot['ROTACION']:.1f} veces/anio): "
+            "esta ultima inmoviliza capital en inventario por mas tiempo."
+        )
+
+    if df_rs["GMROI"].notna().any():
+        mejor_gmroi = df_rs.loc[df_rs["GMROI"].idxmax()]
+        peor_gmroi = df_rs.loc[df_rs["GMROI"].idxmin()]
+        conclusiones.append(
+            f"El GMROI mas alto es el de {mejor_gmroi['unique_id']} (${mejor_gmroi['GMROI']:.1f} de utilidad bruta "
+            f"por cada $1 de inventario promedio); el mas bajo es {peor_gmroi['unique_id']} "
+            f"(${peor_gmroi['GMROI']:.1f}), la referencia que menos rentabiliza su inventario."
+        )
+
+    return conclusiones
+
+
+# ---------------------------------------------------------------------------
 # Interfaz de Streamlit
 # ---------------------------------------------------------------------------
 
@@ -1209,16 +1494,18 @@ with st.container(key="header_banner"):
     st.title("ERP MotoTrack", icon=":material/factory:")
 
 if MOSTRAR_TAB_EOQ:
-    tab_pronostico, tab_clasificacion, tab_eoq = st.tabs(
+    tab_pronostico, tab_clasificacion, tab_revision, tab_eoq = st.tabs(
         [":material/trending_up: Pronostico de demanda",
          ":material/inventory_2: Clasificacion ABC y XYZ",
+         ":material/event_repeat: Revision Periodica (R,S)",
          ":material/local_shipping: EOQ de materias primas"],
         key="tabs_principales",
     )
 else:
-    tab_pronostico, tab_clasificacion = st.tabs(
+    tab_pronostico, tab_clasificacion, tab_revision = st.tabs(
         [":material/trending_up: Pronostico de demanda",
-         ":material/inventory_2: Clasificacion ABC y XYZ"],
+         ":material/inventory_2: Clasificacion ABC y XYZ",
+         ":material/event_repeat: Revision Periodica (R,S)"],
         key="tabs_principales",
     )
 
@@ -1272,6 +1559,16 @@ with tab_pronostico:
                 st.warning(
                     "El pronostico de demanda quedo listo, pero no se pudo leer la "
                     "informacion de materiales/transporte para la pestana de EOQ. "
+                    f"Detalle: {e}"
+                )
+
+            try:
+                st.session_state["lead_times"] = extraer_lead_times_internos(archivo)
+            except Exception as e:
+                st.session_state.pop("lead_times", None)
+                st.warning(
+                    "El pronostico de demanda quedo listo, pero no se pudo leer el lead "
+                    "time (hoja 'Transportation') para la pestana de Revision Periodica. "
                     f"Detalle: {e}"
                 )
 
@@ -1483,7 +1780,118 @@ with tab_clasificacion:
         except Exception as e:
             st.error(f"No se pudo generar el reporte PDF. Detalle: {e}")
 
-# ---- Pestana 3: EOQ de materias primas (oculta por ahora, ver MOSTRAR_TAB_EOQ) --
+# ---- Pestana 3: Revision Periodica (R,S) -----------------------------------
+with tab_revision:
+    st.header("Revision Periodica (R,S) MotoTrack", icon=":material/event_repeat:")
+    st.write(
+        "Calcula el S_max de cada SKU real (Norte, Centro, Sur y CEDI) con el modelo "
+        "de revision periodica (R,S), a partir del pronostico y el RMSE que ya "
+        "calculamos en la pestana 1, y del lead time de cada sede (hoja "
+        "'Transportation' del archivo de demanda)."
+    )
+    st.caption(
+        "El juego no exporta inventario ni ventas reales turno a turno (la hoja "
+        "'Storage' solo trae capacidad y costos, no unidades disponibles), asi que el "
+        "Fill Rate, la rotacion y el GMROI de esta pestana son **valores esperados**, "
+        "calculados analiticamente con la funcion de perdida normal del vendedor de "
+        "periodicos, no observados del juego. Cada vez que se sube un turno nuevo y se "
+        "genera esta politica, el resultado queda guardado para ver su evolucion turno a turno."
+    )
+
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        r_revision = st.number_input(
+            "R (turnos entre revisiones)", min_value=1, value=R_REVISION_DEFAULT, step=1, key="r_revision"
+        )
+    with col_r2:
+        nsc_pct = st.number_input(
+            "Nivel de servicio de ciclo NSC (%)", min_value=1.0, max_value=99.9,
+            value=NSC_DEFAULT, step=0.5, key="nsc_pct",
+        )
+
+    generar_rs = st.button("Generar politica (R,S)", icon=":material/play_arrow:", type="primary")
+
+    if generar_rs:
+        faltantes = []
+        if "df_long_completo" not in st.session_state:
+            faltantes.append("subir el archivo de demanda en la pestana 'Pronostico de demanda'")
+        if "tabla_resumen" not in st.session_state:
+            faltantes.append("generar el pronostico en la pestana 'Pronostico de demanda'")
+        if "lead_times" not in st.session_state:
+            faltantes.append("volver a subir el archivo de demanda (no se pudo leer la hoja 'Transportation')")
+        if not COSTOS_PATH.exists():
+            faltantes.append("subir un archivo de costos valido en la pestana de clasificacion")
+
+        if faltantes:
+            st.error("Antes de calcular la politica (R,S), falta: " + "; ".join(faltantes) + ".")
+        else:
+            try:
+                df_costos = cargar_costos_guardados()
+            except Exception as e:
+                df_costos = None
+                st.error(f"No se pudo leer el archivo de costos guardado. Detalle: {e}")
+
+            if df_costos is not None:
+                df_rs = calcular_revision_periodica(
+                    st.session_state["tabla_resumen"], st.session_state["lead_times"], int(r_revision), nsc_pct
+                )
+                if df_rs.empty:
+                    st.error(
+                        "No se pudo calcular ningun SKU: revisa que el pronostico (h) alcance a cubrir "
+                        "R+L turnos, y que el archivo de demanda tenga el lead time de Norte/Centro/Sur/CEDI."
+                    )
+                else:
+                    demanda_anual_real = calcular_demanda_anual_real(
+                        st.session_state["df_long_completo"], REGIONALES_RS
+                    )
+                    df_rs = calcular_rotacion_gmroi(df_rs, demanda_anual_real, df_costos, precios_actuales)
+                    turno_max = int(st.session_state["df_long_completo"]["Turn"].max())
+                    guardar_historico_rs(df_rs, turno_max)
+                    st.session_state["df_revision_periodica"] = df_rs
+
+    if "df_revision_periodica" in st.session_state:
+        df_rs = st.session_state["df_revision_periodica"]
+
+        fill_global = 1 - df_rs["PERDIDA_ESPERADA_UND"].sum() / df_rs["DEMANDA_R_MAS_L"].sum()
+        col_k1, col_k2, col_k3 = st.columns(3)
+        col_k1.metric("Fill Rate esperado global", f"{fill_global * 100:.1f}%")
+        col_k2.metric("Rotacion promedio", f"{df_rs['ROTACION'].mean():.2f}")
+        col_k3.metric("GMROI promedio", f"{df_rs['GMROI'].mean():.2f}")
+
+        st.subheader("Tabla S_max, Fill Rate, Rotacion y GMROI", icon=":material/table_chart:")
+        columnas_mostrar = [
+            "REGIONAL", "PRODUCTO", "MODELO", "R", "L", "RMSE", "STOCK_SEGURIDAD", "S_MAX",
+            "FILL_RATE_ESPERADO_PCT", "INVENTARIO_PROMEDIO_UND", "ROTACION", "GMROI",
+        ]
+        st.dataframe(df_rs[columnas_mostrar], width="stretch")
+
+        excel_bytes_rs = df_a_excel_bytes(df_rs[columnas_mostrar])
+        st.download_button(
+            "Descargar politica (R,S) en Excel",
+            data=excel_bytes_rs,
+            file_name="revision_periodica_rs_mototrack.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
+        )
+
+        st.subheader("Fill Rate esperado por SKU", icon=":material/bar_chart:")
+        st.plotly_chart(construir_grafica_fill_rate(df_rs, nsc_pct), width="stretch")
+
+        df_historico = cargar_historico_rs()
+        if not df_historico.empty and df_historico["TURNO"].nunique() > 1:
+            st.subheader("Evolucion del Fill Rate esperado por turno jugado", icon=":material/show_chart:")
+            st.plotly_chart(construir_grafica_historico_fill_rate(df_historico), width="stretch")
+        else:
+            st.caption(
+                "La grafica de evolucion por turno aparece cuando se haya generado esta politica "
+                "en al menos dos turnos distintos (sube el turno siguiente y vuelve a generar)."
+            )
+
+        st.subheader("Conclusiones", icon=":material/summarize:")
+        for conclusion in generar_conclusiones_rs(df_rs):
+            st.write(f"- {conclusion}")
+
+# ---- Pestana 4: EOQ de materias primas (oculta por ahora, ver MOSTRAR_TAB_EOQ) --
 if MOSTRAR_TAB_EOQ:
     with tab_eoq:
         st.header("EOQ de Materias Primas MotoTrack", icon=":material/local_shipping:")
