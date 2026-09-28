@@ -1572,6 +1572,20 @@ with tab_pronostico:
                     f"Detalle: {e}"
                 )
 
+            # Si el mismo archivo trae ademas la hoja 'Costos' (algunas
+            # descargas del juego ya la incluyen), la guardamos de una vez
+            # para no obligar a subirla aparte en la pestana de Clasificacion.
+            try:
+                extraer_costo_por_producto(archivo)
+                archivo.seek(0)
+                guardar_costos(archivo)
+                st.success(
+                    "El archivo tambien traia la hoja 'Costos': se guardo automaticamente "
+                    "para la pestana de Clasificacion ABC y XYZ."
+                )
+            except Exception:
+                pass  # el archivo de demanda no trae hoja 'Costos'; se puede subir aparte
+
     generar = st.button("Generar pronostico", icon=":material/play_arrow:", type="primary")
 
     if generar:
