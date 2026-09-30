@@ -1439,9 +1439,9 @@ def generar_conclusiones_rs(df_rs: pd.DataFrame) -> list:
         mejor_gmroi = df_rs.loc[df_rs["GMROI"].idxmax()]
         peor_gmroi = df_rs.loc[df_rs["GMROI"].idxmin()]
         conclusiones.append(
-            f"El GMROI mas alto es el de {mejor_gmroi['unique_id']} (${mejor_gmroi['GMROI']:.1f} de utilidad bruta "
-            f"por cada $1 de inventario promedio); el mas bajo es {peor_gmroi['unique_id']} "
-            f"(${peor_gmroi['GMROI']:.1f}), la referencia que menos rentabiliza su inventario."
+            f"El GMROI mas alto es el de {mejor_gmroi['unique_id']} ({mejor_gmroi['GMROI']:.1f} pesos de "
+            f"utilidad bruta por cada peso de inventario promedio); el mas bajo es {peor_gmroi['unique_id']} "
+            f"({peor_gmroi['GMROI']:.1f}), la referencia que menos rentabiliza su inventario."
         )
 
     return conclusiones
